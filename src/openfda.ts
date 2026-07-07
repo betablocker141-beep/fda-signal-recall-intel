@@ -68,7 +68,9 @@ export const MONITORED_DEVICES: DeviceInfo[] = [
 ];
 
 function apiKeyParam(): string {
-  const key = import.meta.env.VITE_OPENFDA_API_KEY as string | undefined;
+  // trim() also strips a BOM (U+FEFF) that Windows tooling can prepend when
+  // the env value is piped in — openFDA rejects such a key as "missing"
+  const key = (import.meta.env.VITE_OPENFDA_API_KEY as string | undefined)?.trim();
   return key ? `&api_key=${encodeURIComponent(key)}` : "";
 }
 
