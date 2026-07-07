@@ -72,15 +72,43 @@ function apiKeyParam(): string {
   return key ? `&api_key=${encodeURIComponent(key)}` : "";
 }
 
-/** openFDA returns HTTP 404 for zero matches — treat that as an empty result. */
-async function getJson(url: string): Promise<any | null> {
-  const res = await fetch(url);
+// ---- global throttle: keyed openFDA allows 240 req/min; pace at ~215/min ----
+const REQUEST_SPACING_MS = 280;
+let nextRequestAt = 0;
+async function throttle(): Promise<void> {
+  const now = Date.now();
+  const at = Math.max(now, nextRequestAt);
+  nextRequestAt = at + REQUEST_SPACING_MS;
+  if (at > now) await new Promise((r) => setTimeout(r, at - now));
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * openFDA returns HTTP 404 for zero matches — treat that as an empty result.
+ * 429 (rate limit) and 5xx are retried with backoff; 403 means missing key.
+ */
+async function getJson(url: string, attempt = 0): Promise<any | null> {
+  await throttle();
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    if (attempt >= 3) throw e;
+    await sleep(1000 * 2 ** attempt);
+    return getJson(url, attempt + 1);
+  }
   if (res.status === 404) return null;
   if (res.status === 403) {
     throw new Error(
       "openFDA 403 — device/event requires an API key. Get a free key at " +
         "https://open.fda.gov/apis/authentication/ and set VITE_OPENFDA_API_KEY in .env",
     );
+  }
+  if ((res.status === 429 || res.status >= 500) && attempt < 3) {
+    const retryAfter = Number(res.headers.get("retry-after")) || 0;
+    await sleep(Math.max(retryAfter * 1000, 1000 * 2 ** attempt));
+    return getJson(url, attempt + 1);
   }
   if (!res.ok) throw new Error(`openFDA ${res.status}: ${url}`);
   return res.json();
@@ -124,15 +152,26 @@ async function fetchDeviceProblems(code: string, from: string, to: string): Prom
   return out;
 }
 
+/** Split [from, to] (yyyymmdd) into spans of <= 900 days (count cap is 1000 buckets). */
+function dateSpans(from: string, to: string): Array<[string, string]> {
+  const parse = (s: string) => new Date(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T00:00:00`);
+  const spans: Array<[string, string]> = [];
+  let cursor = parse(from);
+  const end = parse(to);
+  while (cursor <= end) {
+    const spanEnd = new Date(cursor);
+    spanEnd.setDate(spanEnd.getDate() + 899);
+    spans.push([yyyymmdd(cursor), yyyymmdd(spanEnd < end ? spanEnd : end)]);
+    cursor = new Date(spanEnd);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return spans;
+}
+
 async function fetchDeviceMonthly(code: string, from: string, to: string, months: string[]): Promise<MonthCount[]> {
   const byMonth = new Map(months.map((m) => [m, 0]));
-  // one count query per calendar year: <= 366 daily buckets, under the 1000 cap
-  const fromYear = Number(from.slice(0, 4));
-  const toYear = Number(to.slice(0, 4));
-  for (let year = fromYear; year <= toYear; year++) {
-    const yFrom = year === fromYear ? from : `${year}0101`;
-    const yTo = year === toYear ? to : `${year}1231`;
-    const search = `device.device_report_product_code:"${code}" AND date_received:[${yFrom} TO ${yTo}]`;
+  for (const [sFrom, sTo] of dateSpans(from, to)) {
+    const search = `device.device_report_product_code:"${code}" AND date_received:[${sFrom} TO ${sTo}]`;
     const rows = await countQuery("device/event", search, "date_received");
     for (const r of rows) {
       if (!r.time || r.time.length < 6) continue;
@@ -165,8 +204,16 @@ async function fetchRecalls(code: string): Promise<Recall[]> {
     .filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.event_date_initiated));
 }
 
-/** The full live dataset for the trailing window across MONITORED_DEVICES. */
-export async function fetchLiveDataset(windowMonths: number): Promise<Dataset> {
+/**
+ * The full live dataset for the trailing window across MONITORED_DEVICES.
+ * Requests are globally throttled under the openFDA rate limit; a device that
+ * still fails after retries is skipped (with a console warning) instead of
+ * failing the whole load. Throws only when every device failed.
+ */
+export async function fetchLiveDataset(
+  windowMonths: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Dataset> {
   const months = trailingMonths(windowMonths);
   const fromDate = new Date(`${months[0]}-01T00:00:00`);
   const from = yyyymmdd(fromDate);
@@ -176,27 +223,44 @@ export async function fetchLiveDataset(windowMonths: number): Promise<Dataset> {
   const deviceMonthly: Record<string, MonthCount[]> = {};
   const deviceProblems: Record<string, Record<string, number>> = {};
   const recalls: Recall[] = [];
+  const succeeded: DeviceInfo[] = [];
+  const failed: string[] = [];
+  let done = 0;
 
-  // small concurrency pool: fast enough for ~30 devices, still well under the
-  // keyed openFDA rate limit (240 requests/minute)
-  const CONCURRENCY = 5;
+  // the pool keeps a few devices in flight; the global throttle sets the pace
+  const CONCURRENCY = 4;
   let next = 0;
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, MONITORED_DEVICES.length) }, async () => {
       while (next < MONITORED_DEVICES.length) {
         const dev = MONITORED_DEVICES[next++];
         const code = dev.product_code;
-        deviceProblems[code] = await fetchDeviceProblems(code, from, to);
-        deviceMonthly[code] = await fetchDeviceMonthly(code, from, to, months);
-        const r = await fetchRecalls(code);
-        recalls.push(...r.filter((x) => x.event_date_initiated >= fromIso));
+        try {
+          const problems = await fetchDeviceProblems(code, from, to);
+          const monthly = await fetchDeviceMonthly(code, from, to, months);
+          const r = await fetchRecalls(code);
+          deviceProblems[code] = problems;
+          deviceMonthly[code] = monthly;
+          recalls.push(...r.filter((x) => x.event_date_initiated >= fromIso));
+          succeeded.push(dev);
+        } catch (e: any) {
+          failed.push(code);
+          console.warn(`[openfda] ${code} failed, skipping:`, e?.message ?? e);
+        }
+        done += 1;
+        onProgress?.(done, MONITORED_DEVICES.length);
       }
     }),
   );
 
+  if (succeeded.length === 0) throw new Error(`openFDA: all ${MONITORED_DEVICES.length} devices failed`);
+  if (failed.length > 0) console.warn(`[openfda] loaded ${succeeded.length}, skipped ${failed.join(", ")}`);
+
+  // keep the original list order for the UI
+  const devices = MONITORED_DEVICES.filter((d) => succeeded.some((s) => s.product_code === d.product_code));
   return {
     months,
-    devices: MONITORED_DEVICES,
+    devices,
     deviceMonthly,
     deviceProblems,
     recalls: recalls.sort((a, b) => b.event_date_initiated.localeCompare(a.event_date_initiated)),

@@ -34,18 +34,23 @@ function ci(r: { value: number; lo: number; hi: number } | null): string {
 }
 
 export default function App() {
-  const [windowMonths, setWindowMonths] = useState<(typeof WINDOWS)[number]>(36);
+  const [windowMonths, setWindowMonths] = useState<(typeof WINDOWS)[number]>(12);
   const [dataset, setDataset] = useState<Dataset | null>(null);
   const [selected, setSelected] = useState<string>("");
   const [loading, setLoading] = useState(true);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    loadDataset(windowMonths).then((ds) => {
+    setProgress(null);
+    loadDataset(windowMonths, (done, total) => {
+      if (alive) setProgress({ done, total });
+    }).then((ds) => {
       if (!alive) return;
       setDataset(ds);
       setLoading(false);
+      setProgress(null);
     });
     return () => {
       alive = false;
@@ -138,7 +143,11 @@ export default function App() {
             ))}
           </select>
         </label>
-        {loading && <span className="muted">loading…</span>}
+        {loading && (
+          <span className="muted">
+            {progress ? `fetching openFDA… ${progress.done}/${progress.total} devices` : "loading…"}
+          </span>
+        )}
       </div>
 
       <section className="kpis">

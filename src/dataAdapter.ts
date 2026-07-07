@@ -12,10 +12,13 @@ import type { Dataset } from "./types";
 
 export const SOURCE: "mock" | "live" = "live";
 
-export async function loadDataset(windowMonths: number): Promise<Dataset> {
+export async function loadDataset(
+  windowMonths: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Dataset> {
   if (SOURCE === "mock") return generateMockDataset(windowMonths);
   try {
-    return await fetchLiveDataset(windowMonths);
+    return await fetchLiveDataset(windowMonths, onProgress);
   } catch (e: any) {
     console.warn("[dataAdapter] openFDA unavailable, using mock dataset:", e?.message ?? e);
     return generateMockDataset(windowMonths);
